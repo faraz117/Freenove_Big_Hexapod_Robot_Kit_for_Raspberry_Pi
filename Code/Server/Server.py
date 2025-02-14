@@ -76,7 +76,7 @@ class Server:
         self.server_socket.close()
         try:
             with picamera.PiCamera() as camera:
-                camera.resolution = (400,300)       # pi camera resolution
+                camera.resolution = (400,300)      # pi camera resolution
                 camera.framerate = 15               # 15 frames/sec
                 camera.saturation = 80              # Set image video saturation
                 camera.brightness = 50              # Set the brightness of the image (50 indicates the state of white balance)

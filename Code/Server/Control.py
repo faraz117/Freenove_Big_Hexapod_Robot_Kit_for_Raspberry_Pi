@@ -187,10 +187,6 @@ class Control:
                     self.flag=0x03
             elif cmd.CMD_BALANCE in self.order and len(self.order)==2:
                 if self.order[1] =="1":
-                    self.order=['','','','','',''] 
-                    if self.flag!=0x04:
-                        self.relax(False)
-                    self.flag=0x04
                     self.imu6050()
             elif cmd.CMD_CALIBRATION in self.order:
                 self.timeout=0
