@@ -62,6 +62,11 @@ class Ui_server(object):
         self.pushButton_On_And_Off.setGeometry(QtCore.QRect(160, 220, 80, 30))
         self.pushButton_On_And_Off.setObjectName("pushButton_On_And_Off")
 
+        # New button for Autonomous Mode
+        self.pushButton_Autonomous = QtWidgets.QPushButton(server)
+        self.pushButton_Autonomous.setGeometry(QtCore.QRect(160, 260, 80, 30))  # Position below the On/Off button
+        self.pushButton_Autonomous.setObjectName("pushButton_Autonomous")
+
         self.retranslateUi(server)
         QtCore.QMetaObject.connectSlotsByName(server)
 
@@ -70,4 +75,4 @@ class Ui_server(object):
         server.setWindowTitle(_translate("server", "Server"))
         self.states.setText(_translate("server", "Off"))
         self.pushButton_On_And_Off.setText(_translate("server", "On"))
-
+        self.pushButton_Autonomous.setText(_translate("server", "Autonomous"))  # Set text for the new button
