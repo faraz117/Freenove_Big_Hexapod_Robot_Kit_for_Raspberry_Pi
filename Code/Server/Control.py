@@ -352,17 +352,17 @@ class Control:
             self.coordinateTransformation(point)
             self.setLegAngle()
  
-    def run(self,data,Z=40,F=64):#example : data=['CMD_MOVE', '1', '0', '25', '10', '0']
+    def run(self,data,Z=30,F=64):#example : data=['CMD_MOVE', '1', '0', '25', '10', '0']
         gait=data[1]
         x=self.restriction(int(data[2]),-35,35)
         y=self.restriction(int(data[3]),-35,35)
         if gait=="1" :
-            F=round(self.map(int(data[4]),2,10,126,22))
+            F=round(self.map(int(data[4]),2,10,126,16))
         else:
-            F=round(self.map(int(data[4]),2,10,171,45))
+            F=round(self.map(int(data[4]),2,10,171,32))
         angle=int(data[5])
         z=Z/F
-        delay=0.01
+        delay=0.005
         point=copy.deepcopy(self.body_point)
         #if y < 0:
         #   angle=-angle 
@@ -440,20 +440,3 @@ class Control:
                              
 if __name__=='__main__':
     pass
-    
-
-
-
-
-   
-   
-
-            
-        
-        
-        
-            
-        
-            
-
-  
