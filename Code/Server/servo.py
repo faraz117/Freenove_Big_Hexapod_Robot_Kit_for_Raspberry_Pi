@@ -41,6 +41,40 @@ class Servo:
             self.pwm_40.set_pwm(i + 8, 4096, 4096)
 
 
+class NullServo:
+    """Drop-in stand-in for Servo when the PCA9685 boards aren't responding on I2C
+    (e.g. battery/power to the servo board disconnected). Every call is a silent no-op,
+    so calibrate()/set_leg_angles()/run_gait() etc. keep working unmodified against this -
+    they just don't actually move anything - instead of every call site needing a None check."""
+    def set_servo_angle(self, channel, angle):
+        pass
+
+    def relax(self):
+        pass
+
+
+class SupervisedServo:
+    """Wraps a real Servo so a mid-operation I2C dropout (battery sags/disconnects while
+    already running, not just at startup) can't silently kill whichever background thread
+    happened to be calling set_servo_angle() at the time - it reports the failure back to
+    on_failure instead of letting the exception propagate and take the thread down with it."""
+    def __init__(self, servo, on_failure):
+        self.servo = servo
+        self.on_failure = on_failure
+
+    def set_servo_angle(self, channel, angle):
+        try:
+            self.servo.set_servo_angle(channel, angle)
+        except Exception as e:
+            self.on_failure(e)
+
+    def relax(self):
+        try:
+            self.servo.relax()
+        except Exception as e:
+            self.on_failure(e)
+
+
 # Main program logic follows:
 if __name__ == '__main__':
     print("Now servos will rotate to certain angles.")

@@ -3,7 +3,7 @@ from picamera2 import Picamera2, Preview
 from picamera2.encoders import H264Encoder, JpegEncoder
 from picamera2.outputs import FileOutput
 from libcamera import Transform
-from threading import Condition
+from threading import Condition, Lock
 import io
 
 class StreamingOutput(io.BufferedIOBase):
@@ -37,6 +37,10 @@ class Camera:
         self.stream_config = self.camera.create_video_configuration(main={"size": stream_size}, transform=self.transform)  # Create the video configuration
         self.streaming_output = StreamingOutput()  # Initialize the streaming output object
         self.streaming = False  # Initialize the streaming flag
+        self.stream_lock = Lock()  # Guards start_stream/stop_stream - multiple threads (GUI preview,
+                                    # obstacle detection, TCP video) can call these concurrently, and an
+                                    # unguarded "if not self.streaming" check/start is a race that corrupts
+                                    # picamera2's internal buffer bookkeeping if two threads both restart it
 
     def start_image(self) -> None:
         """Start the camera preview and capture."""
@@ -54,34 +58,36 @@ class Camera:
 
     def start_stream(self, filename: str = None) -> None:
         """Start the video stream or recording."""
-        if not self.streaming:
-            if self.camera.started:
-                self.camera.stop()                         # Stop the camera if it is currently running
-            
-            self.camera.configure(self.stream_config)      # Configure the camera with the video stream settings
-            if filename:
-                encoder = H264Encoder()                    # Use H264 encoder for video recording
-                output = FileOutput(filename)              # Set the output file for the recorded video
-            else:
-                encoder = JpegEncoder()                    # Use Jpeg encoder for streaming
-                output = FileOutput(self.streaming_output) # Set the streaming output object
-            self.camera.start_recording(encoder, output)   # Start recording or streaming
-            self.streaming = True                          # Set the streaming flag to True
+        with self.stream_lock:
+            if not self.streaming:
+                if self.camera.started:
+                    self.camera.stop()                         # Stop the camera if it is currently running
+
+                self.camera.configure(self.stream_config)      # Configure the camera with the video stream settings
+                if filename:
+                    encoder = H264Encoder()                    # Use H264 encoder for video recording
+                    output = FileOutput(filename)              # Set the output file for the recorded video
+                else:
+                    encoder = JpegEncoder()                    # Use Jpeg encoder for streaming
+                    output = FileOutput(self.streaming_output) # Set the streaming output object
+                self.camera.start_recording(encoder, output)   # Start recording or streaming
+                self.streaming = True                          # Set the streaming flag to True
 
     def stop_stream(self) -> None:
         """Stop the video stream or recording."""
-        if self.streaming:
-            try:
-                self.camera.stop_recording()               # Stop the recording or streaming
-                self.streaming = False                     # Set the streaming flag to False
-            except Exception as e:
-                print(f"Error stopping stream: {e}")       # Print error message if stopping fails
+        with self.stream_lock:
+            if self.streaming:
+                try:
+                    self.camera.stop_recording()               # Stop the recording or streaming
+                    self.streaming = False                     # Set the streaming flag to False
+                except Exception as e:
+                    print(f"Error stopping stream: {e}")       # Print error message if stopping fails
 
-    def get_frame(self) -> bytes:
+    def get_frame(self, timeout: float = 2.0) -> bytes:
         """Get the current frame from the streaming output."""
         with self.streaming_output.condition:
-            self.streaming_output.condition.wait()         # Wait for a new frame to be available
-            return self.streaming_output.frame             # Return the current frame
+            self.streaming_output.condition.wait(timeout=timeout)  # Wait for a new frame, but don't block forever if the stream stalls
+            return self.streaming_output.frame             # Return the current (possibly stale, if we timed out) frame
 
     def save_video(self, filename: str, duration: int = 10) -> None:
         """Save a video for the specified duration."""

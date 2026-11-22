@@ -7,7 +7,7 @@ import struct
 from threading import Condition
 import threading
 from led import Led
-from servo import Servo
+from servo import Servo, NullServo
 from Thread import stop_thread
 from buzzer import Buzzer
 from control import Control
@@ -33,14 +33,34 @@ class Server:
         self.is_servo_relaxed = False
         self.led_controller = Led()
         self.adc_sensor = ADC()
-        self.servo_controller = Servo()
+        self.servo_controller = self.init_servo_controller()
         self.buzzer_controller = Buzzer()
-        self.control_system = Control()
         self.ultrasonic_sensor = Ultrasonic()
-        self.camera_device = Camera()  
-        self.led_thread = None 
-        self.ultrasonic_thread = None  
+        self.camera_device = Camera()
+        self.control_system = Control(self.ultrasonic_sensor, self.led_controller, self.buzzer_controller, self.camera_device)
+        self.led_thread = None
+        self.ultrasonic_thread = None
         self.control_system.condition_thread.start()
+        self.control_system.sensor_thread.start()
+        self.control_system.patrol_thread.start()
+
+    def init_servo_controller(self):
+        # The PCA9685 boards can be unresponsive on I2C (e.g. the battery powering them is
+        # disconnected, even though the Pi itself is powered separately and fine). Fall back
+        # to a no-op stub rather than letting this take down the whole server/GUI.
+        try:
+            return Servo()
+        except Exception as e:
+            print("Server: Servo init failed, I2C not responsive:", e)
+            return NullServo()
+
+    def recheck_i2c(self):
+        # Retries bringing up everything that depends on I2C (this server's own head/camera
+        # servo control, plus Control's legs/IMU). Safe to call repeatedly.
+        if isinstance(self.servo_controller, NullServo):
+            self.servo_controller = self.init_servo_controller()
+        control_ok = self.control_system.reinitialize_hardware()
+        return control_ok and not isinstance(self.servo_controller, NullServo)
 
     def get_interface_ip(self):
         # Get the IP address of the wlan0 interface
@@ -117,6 +137,8 @@ class Server:
         try:
             self.command_connection, self.command_client_address = self.command_socket.accept()
             print("Client connection successful !")
+            self.control_system.autonomous_mode = False
+            print("Autonomous patrol disabled - client has control")
         except:
             print("Client connect failed")
         self.command_socket.close()

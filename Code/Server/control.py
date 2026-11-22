@@ -1,20 +1,35 @@
 # -*- coding: utf-8 -*-
+import io
 import time
 import math
 import copy
 import threading
 import numpy as np
+from PIL import Image
 from gpiozero import OutputDevice
 
 from pid import Incremental_PID
 from command import COMMAND as cmd
 from imu import IMU
-from servo import Servo
+from servo import Servo, NullServo, SupervisedServo
 
 class Control:
-    def __init__(self):
-        self.imu = IMU()
-        self.servo = Servo()
+    def __init__(self, ultrasonic=None, led=None, buzzer=None, camera=None):
+        self.hardware_ok = True
+        self.hardware_error = None
+        try:
+            self.imu = IMU()
+            self.servo = SupervisedServo(Servo(), self._handle_servo_failure)
+        except Exception as e:
+            # Most likely the PCA9685/IMU boards aren't responding on I2C (e.g. the
+            # battery powering them is disconnected - the Pi's own supply doesn't reach
+            # that board). Fall back to a no-op servo so everything else (GUI, camera,
+            # sensing) keeps working; reinitialize_hardware() retries this later.
+            print("Control: hardware init failed, I2C not responsive:", e)
+            self.imu = None
+            self.servo = NullServo()
+            self.hardware_ok = False
+            self.hardware_error = str(e)
         self.movement_flag = 0x01
         self.relaxation_flag = False
         self.pid_controller = Incremental_PID(0.500, 0.00, 0.0025)
@@ -34,6 +49,65 @@ class Control:
         self.set_leg_angles()
         self.condition_thread = threading.Thread(target=self.condition_monitor)
         self.Thread_conditiona = threading.Condition()
+        # Autonomous obstacle-avoidance patrol, active until a client connects
+        self.ultrasonic = ultrasonic
+        self.led = led
+        self.buzzer = buzzer
+        self.camera = camera
+        self.camera_baseline = {}  # (pan, tilt) -> slow-moving "normal" brightness at that angle
+        self.last_camera_frame = None  # used to detect a frozen feed (identical bytes repeatedly)
+        self.last_camera_frame_change_time = time.time()
+        self.autonomous_mode = True
+        self.paused = False  # GUI pause/resume button - holds position without stopping sensing
+        self.obstacle_distance = 30  # cm; anything closer counts as an obstacle
+        self.last_distance = None
+        self.last_point_obstacle = False  # did the most recently sampled grid point trip either sensor
+        self.consecutive_evasions = 0  # rounds stuck evading in a row, without a clean forward step between
+        self.distance_map = {}  # (pan, tilt) -> most recent distance, refreshed by the continuous sweep
+        self.detection_grid = {}  # (pan, tilt) -> '0'/'U'/'C'/'B', refreshed by the continuous sweep
+        self.last_obstacle = None  # {'source', 'pan', 'tilt', 'distance'} describing what last tripped a threshold
+        self.sweeping = False
+        self.head_pan_channel = 0  # horizontal pan servo (confirmed on hardware)
+        self.head_tilt_channel = 1  # vertical tilt servo (confirmed on hardware)
+        self.pan_points = [30, 90, 150]
+        self.tilt_points = [70, 90, 130]  # narrower throw than pan - less travel per step at the same settle_time
+        for pan_angle in self.pan_points:
+            for tilt_angle in self.tilt_points:
+                self.detection_grid[(pan_angle, tilt_angle)] = '0'
+        self.patrol_thread = threading.Thread(target=self.autonomous_patrol)
+        self.sensor_thread = threading.Thread(target=self.watch_forward)
+
+    def reinitialize_hardware(self):
+        # Retries bringing up the IMU/servo boards after an earlier I2C failure (e.g. once
+        # the battery powering them is reconnected). Safe to call repeatedly - a no-op if
+        # already working, and leaves the NullServo stub in place if it still fails.
+        if self.hardware_ok:
+            return True
+        try:
+            imu = IMU()
+            servo = Servo()
+        except Exception as e:
+            print("Control: I2C recheck failed, still not responsive:", e)
+            self.hardware_error = str(e)
+            return False
+        self.imu = imu
+        self.servo = SupervisedServo(servo, self._handle_servo_failure)
+        self.hardware_ok = True
+        self.hardware_error = None
+        self.calibrate()
+        self.set_leg_angles()
+        print("Control: I2C recovered, hardware reinitialized")
+        return True
+
+    def _handle_servo_failure(self, error):
+        # Called by SupervisedServo when a real servo call raises mid-operation (e.g. the
+        # battery sags/disconnects while already running) - demote to the no-op stub instead
+        # of letting the exception kill whichever thread was calling it.
+        if self.hardware_ok:
+            print("Control: hardware I/O error during operation, I2C no longer responsive:", error)
+        self.hardware_ok = False
+        self.hardware_error = str(error)
+        self.servo = NullServo()
 
     def read_from_txt(self, filename):
         with open(filename + ".txt", "r") as file:
@@ -217,6 +291,204 @@ class Control:
                         self.save_to_txt(self.calibration_leg_positions, 'point')
                 self.command_queue = ['', '', '', '', '', '']
 
+    def set_led_color(self, r, g, b):
+        try:
+            self.led.led_index(0x7f, r, g, b)
+        except Exception as e:
+            print("autonomous_patrol: LED update failed:", e)
+
+    def set_buzzer(self, state):
+        try:
+            self.buzzer.set_state(state)
+        except Exception as e:
+            print("autonomous_patrol: Buzzer update failed:", e)
+
+    def record_point(self, pan_angle, tilt_angle, distance):
+        # Shared by watch_forward and scan_surroundings: combines both sensors' readings for
+        # one grid point into a single status ('0'/'U'/'C'/'B') and records it.
+        ultrasonic_hit = distance is not None and distance < self.obstacle_distance
+        camera_hit = self.check_camera_obstacle(pan_angle, tilt_angle)
+        if ultrasonic_hit and camera_hit:
+            status, source = 'B', 'both'
+        elif camera_hit:
+            status, source = 'C', 'camera'
+        elif ultrasonic_hit:
+            status, source = 'U', 'ultrasonic'
+        else:
+            status, source = '0', None
+        self.detection_grid[(pan_angle, tilt_angle)] = status
+        if source is not None:
+            self.last_obstacle = {'source': source, 'pan': pan_angle, 'tilt': tilt_angle, 'distance': distance}
+        return status
+
+    def watch_forward(self, interval=0.15):
+        # Holds the head centered and watches straight ahead while walking, instead of
+        # continuously sweeping - cheaper on the servos, and since the head never moves there's
+        # no movement-induced stale echo to wait out, so this can poll much faster than the
+        # sweep could. Only scan_surroundings() (triggered once something gets close) looks
+        # around to find a way out; this just watches the one point directly ahead.
+        center_pan, center_tilt = 90, 90
+        self.servo.set_servo_angle(self.head_pan_channel, center_pan)
+        self.servo.set_servo_angle(self.head_tilt_channel, center_tilt)
+        while True:
+            if not self.autonomous_mode or self.ultrasonic is None or self.sweeping:
+                time.sleep(interval)
+                continue
+            distance = self.ultrasonic.get_distance()
+            self.last_distance = distance
+            self.distance_map[(center_pan, center_tilt)] = distance
+            status = self.record_point(center_pan, center_tilt, distance)
+            self.last_point_obstacle = status != '0'
+            print("watch: pan =", center_pan, "tilt =", center_tilt, "distance =", distance, "status =", status)
+            time.sleep(interval)
+
+    def scan_surroundings(self, settle_time=0.6):
+        # Sweeps the 3x3 pan/tilt grid, sampling both sensors at each of the 9 points to find
+        # a way out. Only called when watch_forward sees something blocking the way ahead -
+        # the head otherwise stays centered and still while walking.
+        self.sweeping = True
+        scan = {}
+        try:
+            for pan_angle in self.pan_points:
+                if not self.autonomous_mode:
+                    break
+                self.servo.set_servo_angle(self.head_pan_channel, pan_angle)
+                for tilt_angle in self.tilt_points:
+                    if not self.autonomous_mode:
+                        break
+                    self.servo.set_servo_angle(self.head_tilt_channel, tilt_angle)
+                    time.sleep(settle_time)
+                    distance = self.ultrasonic.get_distance() if self.ultrasonic is not None else None
+                    scan[(pan_angle, tilt_angle)] = distance
+                    self.record_point(pan_angle, tilt_angle, distance)
+            self.servo.set_servo_angle(self.head_pan_channel, 90)  # recenter
+            self.servo.set_servo_angle(self.head_tilt_channel, 90)
+            time.sleep(settle_time)
+        finally:
+            self.sweeping = False
+        print("autonomous_patrol: scan =", scan)
+        return scan
+
+    def choose_evasion_direction(self, scan):
+        # pan < 90 is one side, > 90 the other (tilt is ignored for left/right); which is
+        # physically left vs right on the robot depends on how the sensor/servo is mounted -
+        # swap the two branches below if it turns out to be picking the side with the wall.
+        left_readings = [d for (pan, tilt), d in scan.items() if pan < 90 and d is not None]
+        right_readings = [d for (pan, tilt), d in scan.items() if pan > 90 and d is not None]
+        left_clearance = sum(left_readings) / len(left_readings) if left_readings else 0
+        right_clearance = sum(right_readings) / len(right_readings) if right_readings else 0
+        if max(left_clearance, right_clearance) < self.obstacle_distance:
+            return 'back'  # both sides still blocked even at their clearest angle
+        return 'left' if left_clearance >= right_clearance else 'right'
+
+    def check_camera_obstacle(self, pan_angle, tilt_angle, deviation_threshold=35, ema_alpha=0.05, stale_after=4.0):
+        # Crude vision signal to cover the ultrasonic sensor's blind spots: tracks a slow-moving
+        # baseline of how bright the view normally looks AT THIS SPECIFIC angle, and flags a
+        # likely obstacle when the current frame's bottom-center crop deviates sharply from it
+        # (e.g. something suddenly fills that region, blocking or shadowing the floor). The
+        # baseline has to be per-angle, not global - the camera is on the same pan/tilt servos
+        # as the ultrasonic sensor, so "looking up" vs "looking at the floor" are naturally very
+        # different brightnesses and would otherwise constantly look like a false obstacle.
+        # This is a cheap heuristic, not real object detection - it can be fooled by lighting
+        # changes, which is why the baseline only drifts to match the scene while nothing is flagged.
+        if self.camera is None:
+            return False
+        try:
+            if not self.camera.streaming:
+                self.camera.start_stream()
+            frame = self.camera.get_frame()
+            if frame is None:
+                return False
+            # picamera2 can wedge (see the "Camera frontend has timed out!" driver error) and
+            # keep handing back the exact same bytes forever. If we trusted that, a frame that
+            # happened to freeze looking different from the baseline would flag an obstacle
+            # permanently - the baseline only adapts while nothing is flagged, so it could never
+            # self-correct. Once a frame has been identical for too long, stop trusting it.
+            if frame == self.last_camera_frame:
+                if time.time() - self.last_camera_frame_change_time > stale_after:
+                    return False
+            else:
+                self.last_camera_frame = frame
+                self.last_camera_frame_change_time = time.time()
+            image = Image.open(io.BytesIO(frame)).convert('L')
+            width, height = image.size
+            crop = image.crop((width // 4, height * 2 // 3, width * 3 // 4, height))
+            brightness = float(np.asarray(crop, dtype=np.float32).mean())
+        except Exception as e:
+            print("check_camera_obstacle:", e)
+            return False
+        key = (pan_angle, tilt_angle)
+        baseline = self.camera_baseline.get(key)
+        if baseline is None:
+            self.camera_baseline[key] = brightness
+            return False
+        deviation = abs(brightness - baseline)
+        obstacle = deviation > deviation_threshold
+        if not obstacle:
+            self.camera_baseline[key] = ema_alpha * brightness + (1 - ema_alpha) * baseline
+        return obstacle
+
+    def autonomous_patrol(self, stance_height=20, lift_height=70, evade_seconds=1.0,
+                          forward_move=['CMD_MOVE', '1', '0', '25', '10', '0']):
+        # Walk forward until the ultrasonic sensor sees an obstacle. On detection, flash the LED red,
+        # and turn/back away for about evade_seconds before resuming forward.
+        # Runs until a client connects (autonomous_mode becomes False).
+        # Speed 10 (max) also shortens each stride's gait cycle, so the patrol loop re-checks
+        # the sensor sooner too - faster walking and faster reaction come from the same change.
+        # stance_height is capped at 20: that's the documented max for CMD_POSITION's z parameter
+        # (the same parameter move_position uses below) - going past it risks the IK silently
+        # clamping a leg angle to 0/180 for an uneven stance instead of an actually taller one.
+        evasive_moves = {
+            'left': ['CMD_MOVE', '1', '0', '0', '10', '-10'],
+            'right': ['CMD_MOVE', '1', '0', '0', '10', '10'],
+            'back': ['CMD_MOVE', '1', '0', '-25', '10', '0'],
+        }
+        self.move_position(0, 0, stance_height)  # stand taller for proper leg clearance while walking
+        print("autonomous_patrol: standing joint angles =", self.current_angles)  # 0 or 180 here means a leg is clamped/maxed out
+        if self.led is not None:
+            self.set_led_color(0, 0, 0)
+        while True:
+            if not self.autonomous_mode:
+                time.sleep(0.1)
+                continue
+            if self.paused:
+                # Sensing (watch_forward) keeps running so the GUI stays live - just stop
+                # issuing movement commands, holding wherever the legs currently are.
+                self.consecutive_evasions = 0
+                time.sleep(0.1)
+                continue
+            # continuous_scan already checks both sensors at whichever point it's currently
+            # sampling and combines them into last_point_obstacle - no need to check again here.
+            obstacle_detected = self.last_point_obstacle
+            if obstacle_detected:
+                if self.led is not None:
+                    self.set_led_color(255, 0, 0)
+                self.consecutive_evasions += 1
+                if self.consecutive_evasions >= 3:
+                    # Stuck in a corner: repeated small left/right nudges aren't escaping it,
+                    # so force a longer, more deliberate back-away instead of repeating the
+                    # same move that already failed twice.
+                    direction = 'back'
+                    duration = evade_seconds * 2
+                    print("autonomous_patrol: stuck for", self.consecutive_evasions,
+                          "rounds, forcing a longer back-away")
+                else:
+                    scan = self.scan_surroundings()
+                    direction = self.choose_evasion_direction(scan)
+                    duration = evade_seconds
+                move = evasive_moves[direction]
+                print("autonomous_patrol: obstacle detected, evading", direction)
+                evade_until = time.time() + duration
+                while time.time() < evade_until:
+                    if not self.autonomous_mode:
+                        break
+                    self.run_gait(move, Z=lift_height)
+                if self.led is not None:
+                    self.set_led_color(0, 0, 0)
+            else:
+                self.consecutive_evasions = 0
+                self.run_gait(forward_move, Z=lift_height)
+
     def relax(self, flag):
         if flag:
             self.servo.relax()
@@ -307,6 +579,9 @@ class Control:
         return foot_positions
 
     def imu6050(self):
+        if self.imu is None:
+            print("imu6050: IMU not available (I2C not responsive)")
+            return
         old_roll = 0
         old_pitch = 0
         points = self.calculate_posture_balance(0, 0, 0)
